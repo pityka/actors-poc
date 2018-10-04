@@ -167,34 +167,26 @@ private[babyactors] object Impl {
     }
 
     def createDispatcher: DispatcherPipes = {
-      val pipeFromChild = mkPipe
-      val pipeToChild = mkPipe
+      val pipeFromChild = Pipe.beforeFork
+      val pipeToChild = Pipe.beforeFork
 
       val forkedPid = unistd.fork()
       if (forkedPid == -1) throw new RuntimeException("fork failed")
       else if (forkedPid == 0) {
         // child
-        unistd.close(pipeFromChild(0))
-        unistd.close(pipeToChild(1))
 
         new Dispatcher(
           multiplex = MultiplexPipes(
-            pipeTo = PipeWriteEnd(pipeFromChild(1), nonBlocking = false),
-            pipeFrom = PipeReadEnd(pipeToChild(0), nonBlocking = false)))
+            pipeTo = Pipe.writeEnd(pipeFromChild, nonBlocking = false),
+            pipeFrom = Pipe.readEnd(pipeToChild, nonBlocking = false)))
 
         throw new RuntimeException("fork child never returns")
       } else {
         // parent
 
-        unistd.close(pipeFromChild(1))
-        unistd.close(pipeToChild(0))
-
-        val fdFrom = pipeFromChild(0)
-        val fdTo = pipeToChild(1)
-
         val pipes = DispatcherPipes(
-          pipeTo = PipeWriteEnd(fdTo, nonBlocking = true),
-          pipeFrom = PipeReadEnd(fdFrom, nonBlocking = true))
+          pipeTo = Pipe.writeEnd(pipeToChild, nonBlocking = true),
+          pipeFrom = Pipe.readEnd(pipeFromChild, nonBlocking = true))
         Multiplex.pids = forkedPid :: Multiplex.pids
         pipes
 
@@ -255,6 +247,22 @@ private[babyactors] object Impl {
       readAll()
     }
 
+  }
+
+  object Pipe {
+    def beforeFork: Ptr[Int] = {
+      mkPipe
+    }
+
+    def readEnd(pipe: Ptr[Int], nonBlocking: Boolean) = {
+      unistd.close(pipe(1))
+      PipeReadEnd(pipe(0), nonBlocking)
+    }
+
+    def writeEnd(pipe: Ptr[Int], nonBlocking: Boolean) = {
+      unistd.close(pipe(0))
+      PipeWriteEnd(pipe(1), nonBlocking)
+    }
   }
 
   case class PipeReadEnd(pipeFrom: Int, nonBlocking: Boolean) {
