@@ -45,10 +45,8 @@ abstract class Actor(ctx: ActorContext) {
   val self = ctx.self
 }
 
-class ActorSystem {
-  private val multiplex = Impl.Multiplex.create
-  def send(m: Message) = multiplex.send(m)
-  def close = multiplex.close
+class ActorSystem(message: Message) {
+  private val multiplex = Impl.Multiplex.create(message)
 }
 
 object ActorSystem {
@@ -66,7 +64,6 @@ case class ActorContext(
 }
 
 class Dispatcher(private val multiplex: Impl.MultiplexPipes) {
-
   private val actors = scala.collection.mutable.Map[ActorRef, Actor]()
   private val localMailbox = scala.collection.mutable.Queue[Message]()
 
@@ -109,7 +106,6 @@ private[babyactors] object Impl {
   import Helpers._
 
   case class DispatcherPipes(pipes: NonBlockingPipes)
-  case class MainPipes(pipes: NonBlockingPipes)
 
   object Multiplex {
 
@@ -120,58 +116,26 @@ private[babyactors] object Impl {
       */
     var pids = List[Int]()
 
-    def create: MultiplexPipes = {
-      val pipeFromChild = mkPipe
-      val pipeToChild = mkPipe
+    def create(firstMessage: Message): Unit = {
 
-      val forkedPid = unistd.fork()
-      if (forkedPid == -1) throw new RuntimeException("fork failed")
-      else if (forkedPid == 0) {
-        // child
-        unistd.close(pipeFromChild(0))
-        unistd.close(pipeToChild(1))
+      val m = new Multiplex(firstMessage)
 
-        val m = new Multiplex(
-          main = MainPipes(
-            NonBlockingPipes(to = pipeFromChild(1), from = pipeToChild(0))))
-
-        def handler(s: Int) = s match {
-          case s if s == signal.SIGTERM => killall(Multiplex.pids)
-          case _                        => println("signal " + signal)
-        }
-
-        signal.signal(signal.SIGTERM, CFunctionPtr.fromFunction1(handler))
-
-        m.loop
-
-        throw new RuntimeException("fork child never returns")
-      } else {
-        // parent
-        unistd.close(pipeFromChild(1))
-        unistd.close(pipeToChild(0))
-
-        val fdFrom = pipeFromChild(0)
-        val fdTo = pipeToChild(1)
-
-        Multiplex.pids = forkedPid :: Multiplex.pids
-
-        def handler(s: Int) = s match {
-          case s if s == signal.SIGTERM =>
-            println("sigterm caught. killing multiplexer " + Multiplex.pids)
-            killall(Multiplex.pids)
-          case _ => println("signal " + signal)
-        }
-
-        signal.signal(signal.SIGTERM, CFunctionPtr.fromFunction1(handler))
-
-        MultiplexPipes(pipeTo = fdTo, pipeFrom = fdFrom, pid = Some(forkedPid))
-
+      def handler(s: Int) = s match {
+        case s if s == signal.SIGTERM => killall(Multiplex.pids)
+        case _                        => println("signal " + signal)
       }
+
+      signal.signal(signal.SIGTERM, CFunctionPtr.fromFunction1(handler))
+
+      m.loop
+
+      throw new RuntimeException("multiplex.loop never returns")
     }
+
   }
 
-  class Multiplex(main: MainPipes) {
-    val buffer = Queue[Message]()
+  class Multiplex(firstMessage: Message) {
+    val buffer = Queue[Message](firstMessage)
     val sendBuffer = Queue[(Message, NonBlockingPipes)]()
     val actors = ListBuffer[(ActorRef, DispatcherPipes)]()
 
@@ -179,7 +143,7 @@ private[babyactors] object Impl {
       actors.map { case (actorRef, pipes) => (actorRef.dispatcher, pipes) }.distinct
 
     def allPipes =
-      actors.iterator.map(_._2.pipes) ++ Iterator.single(main.pipes)
+      actors.iterator.map(_._2.pipes)
 
     def read(pipe: NonBlockingPipes) =
       pipe.nonBlockingRead.foreach { msg =>
@@ -197,7 +161,6 @@ private[babyactors] object Impl {
     }
 
     def createDispatcher: DispatcherPipes = {
-
       val pipeFromChild = mkPipe
       val pipeToChild = mkPipe
 
@@ -426,12 +389,12 @@ private[babyactors] object Impl {
         } else {
           maxIndex = count - 1
           indexInBuffer = 1
-          buffer(0)
+          buffer(0) & 0xFF
         }
       } else {
         val r = buffer(indexInBuffer)
         indexInBuffer += 1
-        r
+        r & 0xFF
       }
   }
 

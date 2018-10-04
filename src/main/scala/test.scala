@@ -58,26 +58,32 @@ class Worker(master: ActorRef, ctx: ActorContext) extends Actor(ctx) {
   }
 }
 
-object Hello extends App {
+class MainActor(ctx: ActorContext) extends Actor(ctx) {
+  def receive: PartialFunction[String, Unit] = {
+    case "start" =>
+      ctx.send(Message(Hello.p1, "0"))
+      ctx.send(Message(Hello.p2, "0"))
+      ctx.send(Message(Hello.master, "work4"))
 
+  }
+}
+
+object Hello extends App {
+  println("start")
   val p1 = ActorRef(1, DispatcherRef(0), ActorName(2))
   val p2 = ActorRef(0, DispatcherRef(1), ActorName(1))
-
   val master = ActorRef(2, DispatcherRef(2), ActorName(3))
 
   // scala native has no reflection, this is an ugly workaround
+  ActorSystem.register(ActorName(-1), (d: ActorContext) => new MainActor(d))
   ActorSystem.register(ActorName(0), (d: ActorContext) => new Counter(d))
   ActorSystem.register(ActorName(1), (d: ActorContext) => new PingPong(p1, d))
   ActorSystem.register(ActorName(2), (d: ActorContext) => new PingPong(p2, d))
   ActorSystem.register(ActorName(3), (d: ActorContext) => new Master(d))
   ActorSystem.register(ActorName(4), (d: ActorContext) => new Worker(master, d))
 
-  val actorSystem = new ActorSystem
-  actorSystem.send(Message(p1, "0"))
-  actorSystem.send(Message(p2, "0"))
-  actorSystem.send(Message(master, "work4"))
+  val actorSystem = new ActorSystem(
+    Message(ActorRef(0, DispatcherRef(0), ActorName(-1)), "start"))
 
-  Thread.sleep(1000000)
-  actorSystem.close
   println("Bye")
 }
