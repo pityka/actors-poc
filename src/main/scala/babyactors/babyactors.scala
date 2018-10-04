@@ -72,7 +72,7 @@ class Dispatcher(private val multiplex: Impl.MultiplexPipes) {
 
   def send(message: Message) =
     if (actors.contains(message.recipient)) localMailbox.enqueue(message)
-    else multiplex.send(message)
+    else multiplex.blockWrite(message)
 
   while (true) {
     val message = next
@@ -173,8 +173,7 @@ private[babyactors] object Impl {
 
         new Dispatcher(
           multiplex = MultiplexPipes(pipeTo = pipeFromChild(1),
-                                     pipeFrom = pipeToChild(0),
-                                     pid = None))
+                                     pipeFrom = pipeToChild(0)))
 
         throw new RuntimeException("fork child never returns")
       } else {
@@ -249,8 +248,7 @@ private[babyactors] object Impl {
 
   }
 
-  case class MultiplexPipes(pipeTo: Int, pipeFrom: Int, pid: Option[Int]) {
-    def close = pid.foreach(pid => signal.kill(pid, signal.SIGTERM))
+  case class MultiplexPipes(pipeTo: Int, pipeFrom: Int) {
     val is = new LibCReadInputStream(pipeFrom, 100)
     def blockRead: Message = {
       val length = java.nio.ByteBuffer.allocate(4)
@@ -271,9 +269,6 @@ private[babyactors] object Impl {
       val frame = Message.toFrame(m)
       val os = new LibCWriteOutputStream(pipeTo)
       os.write(frame, 0, frame.length)
-    }
-    def send(actorMessage: Message) = {
-      blockWrite(actorMessage)
     }
   }
 
