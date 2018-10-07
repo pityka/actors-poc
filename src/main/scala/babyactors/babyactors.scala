@@ -28,8 +28,11 @@ object Message {
     buffer.put(m.payload.getBytes("UTF-8"))
     buffer.array
   }
-  def fromFramePayload(frame: Array[Byte], length: Int): Message = {
+  def fromFramePayload(frame: Array[Byte],
+                       offset: Int,
+                       length: Int): Message = {
     val buffer = java.nio.ByteBuffer.wrap(frame)
+    buffer.position(offset)
     val actor = buffer.getInt
     val dispatcher = buffer.getInt
     val actorName = buffer.getInt
@@ -65,14 +68,11 @@ case class ActorContext(
 
 class Dispatcher(private val multiplex: Impl.MultiplexPipes) {
   private val actors = scala.collection.mutable.Map[ActorRef, Actor]()
-  private val localMailbox = scala.collection.mutable.Queue[Message]()
 
-  private def next =
-    localMailbox.dequeueFirst(_ => true).getOrElse(multiplex.pipeFrom.blockRead)
+  private def next = multiplex.pipeFrom.blockRead
 
   def send(message: Message) =
-    if (actors.contains(message.recipient)) localMailbox.enqueue(message)
-    else multiplex.pipeTo.blockWrite(message)
+    multiplex.pipeTo.blockWrite(message)
 
   while (true) {
     val message = next
@@ -111,8 +111,9 @@ private[babyactors] object Impl {
   import Helpers._
 
   case class DispatcherPipes(pipeTo: Pipe2.ShPipeWriteEnd,
-                             pipeFrom: PipeReadEnd)
-  case class MultiplexPipes(pipeTo: PipeWriteEnd, pipeFrom: Pipe2.ShPipeReadEnd)
+                             pipeFrom: Pipe2.ShPipeReadEnd)
+  case class MultiplexPipes(pipeTo: Pipe2.ShPipeWriteEnd,
+                            pipeFrom: Pipe2.ShPipeReadEnd)
 
   object Multiplex {
 
@@ -142,7 +143,6 @@ private[babyactors] object Impl {
   }
 
   class Multiplex(firstMessage: Message) {
-    var counter = 0
     val buffer = Queue[Message](firstMessage)
     val sendBuffer = Queue[(Message, DispatcherPipes)]()
     val actors = ListBuffer[(ActorRef, DispatcherPipes)]()
@@ -169,9 +169,8 @@ private[babyactors] object Impl {
     }
 
     def createDispatcher: DispatcherPipes = {
-      val pipeFromChild = Pipe.beforeFork
-      val pipeToChild = babyactors.Pipe.allocate("mypipe.shm" + counter)
-      counter += 1
+      val pipeFromChild = babyactors.Pipe.allocate
+      val pipeToChild = babyactors.Pipe.allocate
 
       val forkedPid = unistd.fork()
       if (forkedPid == -1) throw new RuntimeException("fork failed")
@@ -179,17 +178,17 @@ private[babyactors] object Impl {
         // child
 
         new Dispatcher(
-          multiplex = MultiplexPipes(
-            pipeTo = Pipe.writeEnd(pipeFromChild, nonBlocking = false),
-            pipeFrom = Pipe2.ShPipeReadEnd(pipeToChild)))
+          multiplex =
+            MultiplexPipes(pipeTo = Pipe2.ShPipeWriteEnd(pipeFromChild),
+                           pipeFrom = Pipe2.ShPipeReadEnd(pipeToChild)))
 
         throw new RuntimeException("fork child never returns")
       } else {
         // parent
 
-        val pipes = DispatcherPipes(
-          pipeTo = Pipe2.ShPipeWriteEnd(pipeToChild),
-          pipeFrom = Pipe.readEnd(pipeFromChild, nonBlocking = true))
+        val pipes = DispatcherPipes(pipeTo = Pipe2.ShPipeWriteEnd(pipeToChild),
+                                    pipeFrom =
+                                      Pipe2.ShPipeReadEnd(pipeFromChild))
         Multiplex.pids = forkedPid :: Multiplex.pids
         pipes
 
@@ -254,21 +253,44 @@ private[babyactors] object Impl {
 
   object Pipe2 {
     case class ShPipeReadEnd(from: babyactors.Pipe.Pipe) {
-      val buffer = Array.ofDim[Byte](10000)
+      val buffer = Array.ofDim[Byte](100)
       def blockRead: Message = {
 
-        var count = from.read(buffer, 0, false).get
+        var count = from.read(buffer, 0, block = true).get
         val bb = java.nio.ByteBuffer.wrap(buffer)
-
         val length = bb.getInt
         while (count < length + 4) {
-          println("a" + count)
-          count = from.read(buffer, count, false).get
+          count = from.read(buffer, count, block = true).get
         }
-        Message.fromFramePayload(buffer, length)
+        Message.fromFramePayload(buffer, 4, length)
       }
+
+      def nonBlockingRead: Option[Message] = {
+
+        var count = from.read(buffer, 0, block = false)
+        if (count.isEmpty) None
+        else {
+          val bb = java.nio.ByteBuffer.wrap(buffer)
+          val length = bb.getInt
+          while (count.get < length + 4) {
+            count = from.read(buffer, count.get, block = true)
+          }
+          Some(Message.fromFramePayload(buffer, 4, length))
+        }
+      }
+
     }
     case class ShPipeWriteEnd(to: babyactors.Pipe.Pipe) {
+      def blockWrite(message: Message): Unit = {
+        val buffer = Message.toFrame(message)
+        var count = 0
+        val len = buffer.length
+        while (count < len) {
+          val written = to.write(buffer, count, true).get
+          count += written
+        }
+
+      }
       def nonBlockingWrite(message: Message): Boolean = {
         val buffer = Message.toFrame(message)
         var count = 0
@@ -276,7 +298,6 @@ private[babyactors] object Impl {
         var notReady = false
         while (count < len && !notReady) {
           val written = to.write(buffer, count, false)
-          println(written)
           if (written.isEmpty) {
             if (count == 0) {
               notReady = true
@@ -294,7 +315,7 @@ private[babyactors] object Impl {
   }
 
   object Pipe {
-    def beforeFork: Ptr[Int] = {
+    def allocate: Ptr[Int] = {
       mkPipe
     }
 
@@ -327,7 +348,7 @@ private[babyactors] object Impl {
       while (count < buffer.length) {
         count += is.read(buffer, count, buffer.length - count)
       }
-      Message.fromFramePayload(buffer, l)
+      Message.fromFramePayload(buffer, 0, l)
     }
 
     val lengthBuffer = Array.ofDim[Byte](4)
@@ -363,7 +384,7 @@ private[babyactors] object Impl {
           payloadBuffer = Array.ofDim[Byte](length)
         }
         readFully(payloadBuffer, 0, length)
-        Some(Message.fromFramePayload(payloadBuffer, length))
+        Some(Message.fromFramePayload(payloadBuffer, 0, length))
       }
 
     }

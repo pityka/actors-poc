@@ -62,8 +62,9 @@ class MainActor(ctx: ActorContext) extends Actor(ctx) {
   def receive: PartialFunction[String, Unit] = {
     case "start" =>
       println("got start")
-    // ctx.send(Message(Hello.p1, "0"))
-    // ctx.send(Message(Hello.p2, "0"))
+      // ctx.send(Message(ActorRef(2, DispatcherRef(1), ActorName(0)), "boo"))
+      ctx.send(Message(Hello.p1, "0"))
+      ctx.send(Message(Hello.p2, "0"))
     // ctx.send(Message(Hello.master, "work4"))
 
   }
@@ -71,20 +72,20 @@ class MainActor(ctx: ActorContext) extends Actor(ctx) {
 
 object Hello extends App {
   println("start")
-  // val p1 = ActorRef(1, DispatcherRef(0), ActorName(2))
-  // val p2 = ActorRef(0, DispatcherRef(0), ActorName(1))
+  val p1 = ActorRef(1, DispatcherRef(0), ActorName(2))
+  val p2 = ActorRef(0, DispatcherRef(1), ActorName(1))
   // val master = ActorRef(2, DispatcherRef(0), ActorName(3))
 
   // scala native has no reflection, this is an ugly workaround
-  // ActorSystem.register(ActorName(-1), (d: ActorContext) => new MainActor(d))
-  // ActorSystem.register(ActorName(0), (d: ActorContext) => new Counter(d))
-  // ActorSystem.register(ActorName(1), (d: ActorContext) => new PingPong(p1, d))
-  // ActorSystem.register(ActorName(2), (d: ActorContext) => new PingPong(p2, d))
+  ActorSystem.register(ActorName(-1), (d: ActorContext) => new MainActor(d))
+  ActorSystem.register(ActorName(0), (d: ActorContext) => new Counter(d))
+  ActorSystem.register(ActorName(1), (d: ActorContext) => new PingPong(p1, d))
+  ActorSystem.register(ActorName(2), (d: ActorContext) => new PingPong(p2, d))
   // ActorSystem.register(ActorName(3), (d: ActorContext) => new Master(d))
   // ActorSystem.register(ActorName(4), (d: ActorContext) => new Worker(master, d))
 
-  // val actorSystem = new ActorSystem(
-  //   Message(ActorRef(0, DispatcherRef(0), ActorName(-1)), "start"))
+  val actorSystem = new ActorSystem(
+    Message(ActorRef(0, DispatcherRef(0), ActorName(-1)), "start"))
 
   import scalanative.posix.{unistd, fcntl}
   import scalanative.posix
@@ -127,14 +128,17 @@ object Hello extends App {
   //   semaphore.sem_post(sem)
   // }
 
-  println(Pipe.deallocate("pipe.sm3"))
-  val pipe = Pipe.allocate("pipe.sm3")
+  val pipe = Pipe.allocate
+  val pipe2 = Pipe.allocate
   val pid = unistd.fork()
   if (pid == 0) {
     val data = "Hi".getBytes("UTF-8")
     println("child - writing data")
     val count = pipe.write(data, 0, true)
     println(s"child - data written $count. exit child")
+    val buffer = Array.ofDim[Byte](200)
+    pipe2.read(buffer, 0, true)
+    println("child - " + new String(buffer))
     System.exit(0)
   } else {
     val buffer = Array.ofDim[Byte](20)
@@ -142,6 +146,7 @@ object Hello extends App {
     val count = pipe.read(buffer, 0, true)
     println(s"Read data $count")
     println(new String(buffer))
+    pipe2.write(buffer, 0, true)
   }
   println("Bye - parent")
 }
