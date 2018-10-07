@@ -110,8 +110,9 @@ private[babyactors] object Impl {
   }
   import Helpers._
 
-  case class DispatcherPipes(pipeTo: PipeWriteEnd, pipeFrom: PipeReadEnd)
-  case class MultiplexPipes(pipeTo: PipeWriteEnd, pipeFrom: PipeReadEnd)
+  case class DispatcherPipes(pipeTo: Pipe2.ShPipeWriteEnd,
+                             pipeFrom: PipeReadEnd)
+  case class MultiplexPipes(pipeTo: PipeWriteEnd, pipeFrom: Pipe2.ShPipeReadEnd)
 
   object Multiplex {
 
@@ -141,6 +142,7 @@ private[babyactors] object Impl {
   }
 
   class Multiplex(firstMessage: Message) {
+    var counter = 0
     val buffer = Queue[Message](firstMessage)
     val sendBuffer = Queue[(Message, DispatcherPipes)]()
     val actors = ListBuffer[(ActorRef, DispatcherPipes)]()
@@ -157,7 +159,7 @@ private[babyactors] object Impl {
       }
 
     def readAll() =
-      selectedReads.foreach(read)
+      allPipes.foreach(read)
 
     def tryWrite(message: Message, pipes: DispatcherPipes) = {
       val success = pipes.pipeTo.nonBlockingWrite(message)
@@ -168,7 +170,8 @@ private[babyactors] object Impl {
 
     def createDispatcher: DispatcherPipes = {
       val pipeFromChild = Pipe.beforeFork
-      val pipeToChild = Pipe.beforeFork
+      val pipeToChild = babyactors.Pipe.allocate("mypipe.shm" + counter)
+      counter += 1
 
       val forkedPid = unistd.fork()
       if (forkedPid == -1) throw new RuntimeException("fork failed")
@@ -178,14 +181,14 @@ private[babyactors] object Impl {
         new Dispatcher(
           multiplex = MultiplexPipes(
             pipeTo = Pipe.writeEnd(pipeFromChild, nonBlocking = false),
-            pipeFrom = Pipe.readEnd(pipeToChild, nonBlocking = false)))
+            pipeFrom = Pipe2.ShPipeReadEnd(pipeToChild)))
 
         throw new RuntimeException("fork child never returns")
       } else {
         // parent
 
         val pipes = DispatcherPipes(
-          pipeTo = Pipe.writeEnd(pipeToChild, nonBlocking = true),
+          pipeTo = Pipe2.ShPipeWriteEnd(pipeToChild),
           pipeFrom = Pipe.readEnd(pipeFromChild, nonBlocking = true))
         Multiplex.pids = forkedPid :: Multiplex.pids
         pipes
@@ -222,31 +225,72 @@ private[babyactors] object Impl {
     val readSet = stdlib.malloc(8).asInstanceOf[Ptr[select.fd_set]]
     val writeSet = stdlib.malloc(8).asInstanceOf[Ptr[select.fd_set]]
 
-    def selectedReads = allPipes.filter { pipe =>
-      select.FD_ISSET(pipe.pipeFrom.pipeFrom, readSet) > 0
-    }
+    // def selectedReads = allPipes.filter { pipe =>
+    //   select.FD_ISSET(pipe.pipeFrom.pipeFrom, readSet) > 0
+    // }
 
-    def selectIo(): Unit = {
-      val watchedReads = allPipes.map(_.pipeFrom.pipeFrom).toList
-      val watchedWrites = sendBuffer.toList.map(_._2.pipeTo.pipeTo).toList
+    // def selectIo(): Unit = {
+    //   val watchedReads = allPipes.map(_.pipeFrom.pipeFrom).toList
+    //   val watchedWrites = sendBuffer.toList.map(_._2.pipeTo.pipeTo).toList
 
-      select.FD_ZERO(readSet)
-      select.FD_ZERO(writeSet)
-      watchedReads.foreach(fd => select.FD_SET(fd, readSet))
-      watchedWrites.foreach(fd => select.FD_SET(fd, writeSet))
-      val maxFD = math.max(if (watchedReads.isEmpty) 0 else watchedReads.max,
-                           if (watchedWrites.isEmpty) 0 else watchedWrites.max)
-      select.select(maxFD + 1, readSet, writeSet, null, null)
+    //   select.FD_ZERO(readSet)
+    //   select.FD_ZERO(writeSet)
+    //   watchedReads.foreach(fd => select.FD_SET(fd, readSet))
+    //   watchedWrites.foreach(fd => select.FD_SET(fd, writeSet))
+    //   val maxFD = math.max(if (watchedReads.isEmpty) 0 else watchedReads.max,
+    //                        if (watchedWrites.isEmpty) 0 else watchedWrites.max)
+    //   select.select(maxFD + 1, readSet, writeSet, null, null)
 
-    }
+    // }
 
     def loop = while (true) {
       tryWriteAll()
       processAll()
-      selectIo()
+      // selectIo()
       readAll()
     }
 
+  }
+
+  object Pipe2 {
+    case class ShPipeReadEnd(from: babyactors.Pipe.Pipe) {
+      val buffer = Array.ofDim[Byte](10000)
+      def blockRead: Message = {
+
+        var count = from.read(buffer, 0, false).get
+        val bb = java.nio.ByteBuffer.wrap(buffer)
+
+        val length = bb.getInt
+        while (count < length + 4) {
+          println("a" + count)
+          count = from.read(buffer, count, false).get
+        }
+        Message.fromFramePayload(buffer, length)
+      }
+    }
+    case class ShPipeWriteEnd(to: babyactors.Pipe.Pipe) {
+      def nonBlockingWrite(message: Message): Boolean = {
+        val buffer = Message.toFrame(message)
+        var count = 0
+        val len = buffer.length
+        var notReady = false
+        while (count < len && !notReady) {
+          val written = to.write(buffer, count, false)
+          println(written)
+          if (written.isEmpty) {
+            if (count == 0) {
+              notReady = true
+            } else {
+              println("continue to write")
+            }
+          }
+          count += written.getOrElse(0)
+        }
+        if (notReady) false
+        else true
+
+      }
+    }
   }
 
   object Pipe {

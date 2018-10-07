@@ -9,6 +9,6 @@ scalafmtOnCompile in ThisBuild := true
 
 nativeGC := "immix"
 
-nativeMode := "release"
+nativeMode := "debug"
 
 // nativeLTO := "thin"
