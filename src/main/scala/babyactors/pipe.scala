@@ -58,10 +58,22 @@ object Pipe {
 
     private def wait(sem: Ptr[semaphore.sem_t], block: Boolean): Boolean = {
       if (block) {
-        val r = semaphore.sem_wait(sem)
-        if (r == -1 && errno.errno == posix.errno.EINTR)
-          throw new RuntimeException("interrupt")
-
+        var i = 0
+        val max = 100000
+        var go = false
+        while (!go && i < max) {
+          val r = semaphore.sem_trywait(sem)
+          if (r == 0) {
+            go = true
+          }
+          i += 1
+        }
+        if (!go) {
+          // println("over")
+          val r = semaphore.sem_wait(sem)
+          if (r == -1 && errno.errno == posix.errno.EINTR)
+            throw new RuntimeException("interrupt")
+        }
         false
       } else {
         val r = semaphore.sem_trywait(sem)
