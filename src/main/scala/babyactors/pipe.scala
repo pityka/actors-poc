@@ -61,6 +61,7 @@ object Pipe {
         var i = 0
         val max = 100000
         var go = false
+        // sem_trywait keeps in userspace, therefore it is worth to spin a while
         while (!go && i < max) {
           val r = semaphore.sem_trywait(sem)
           if (r == 0) {
@@ -69,7 +70,6 @@ object Pipe {
           i += 1
         }
         if (!go) {
-          // println("over")
           val r = semaphore.sem_wait(sem)
           if (r == -1 && errno.errno == posix.errno.EINTR)
             throw new RuntimeException("interrupt")
