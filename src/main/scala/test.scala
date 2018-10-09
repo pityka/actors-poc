@@ -84,6 +84,16 @@ object Hello extends App {
   // ActorSystem.register(ActorName(3), (d: ActorContext) => new Master(d))
   // ActorSystem.register(ActorName(4), (d: ActorContext) => new Worker(master, d))
 
+  // import scala.scalanative.native._
+  // val test = "Hello"
+  // val ptr = test.cast[Ptr[Byte]]
+  // val test2 = ptr.cast[AnyRef]
+  // test2 match {
+  //   case s: String => println(s)
+  // }
+
+  // System.exit(0)
+
   val actorSystem = new ActorSystem(
     Message(ActorRef(0, DispatcherRef(0), ActorName(-1)), "start"))
 

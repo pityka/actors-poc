@@ -14,16 +14,9 @@ import scalanative.posix.sys.types._
 object Pipe {
   import native._
   import Nat._
-  // type PipeT = Ptr[Byte]
-  // native.CStruct4[semaphore.sem_t,
-  //                 semaphore.sem_t,
-  //                 Int,
-  //                 native.CArray[Byte, _256]]
-  // private val Size_PipeT = native.sizeof[PipeT]
-
   def allocate(elements: Int, blockSize: Int): Pipe = {
-    val capacity = elements * blockSize
-    val size = sizeof[semaphore.sem_t] * 2 + sizeof[native.CInt] + capacity
+    val size = sizeof[semaphore.sem_t] * 3 + elements * blockSize + elements * sizeof[
+      native.CInt]
     import mmanconst._
     val ptr = mman
       .mmap(null,
@@ -37,27 +30,57 @@ object Pipe {
       throw new RuntimeException("mmap failed " + errno.errno + " " + size)
     }
 
-    val pipeT = ptr //.asInstanceOf[Ptr[PipeT]]
-    new Pipe(pipeT, capacity, elements, blockSize)
+    val pipeT = ptr
+    new Pipe(pipeT, elements, blockSize)
+  }
+
+  class Buffer(private val m: Ptr[Byte]) extends AnyVal {
+    def size: Int = m.cast[Ptr[Int]].apply(0)
+    def size_=(c: Int) = (m.cast[Ptr[Int]])(0) = c
+    def buffer = (m + sizeof[native.CInt])
+    def write(data: Array[Byte], offset: Int, blockSize: Int): Int = {
+      val copied = scala.math.min(data.length - offset, blockSize)
+
+      memcpy(dest = buffer,
+             src = data.asInstanceOf[runtime.ByteArray].at(offset),
+             count = copied)
+      size = copied
+      copied
+    }
+
+    def read(data: Array[Byte], offset: Int, blocksize: Int): Int = {
+      val copied = size
+      if (offset + copied >= data.length) -1
+      else {
+        memcpy(dest = data.asInstanceOf[runtime.ByteArray].at(offset),
+               src = buffer,
+               count = copied)
+        copied
+      }
+
+    }
+
   }
 
   class Pipe private[babyactors] (private val m: Ptr[Byte],
-                                  private val capacity: Int,
                                   private val elements: Int,
-                                  private val blockSize: Int) {
+                                  val blockSize: Int) {
     private def semFull: Ptr[semaphore.sem_t] = m.cast[Ptr[semaphore.sem_t]]
     private def semEmpty: Ptr[semaphore.sem_t] =
       (m + sizeof[semaphore.sem_t]).cast[Ptr[semaphore.sem_t]]
-    private def bufferSize: Int = m(sizeof[semaphore.sem_t] * 2)
-    private def bufferSize_=(c: Int) = {
-      val m2 = (m + sizeof[semaphore.sem_t] * 2).cast[Ptr[Int]]
-      m2(0) = c
-    }
-    private def buffer: Ptr[Byte] =
-      m + sizeof[semaphore.sem_t] * 2 + sizeof[native.CInt]
+    private def semLock: Ptr[semaphore.sem_t] =
+      (m + 2 * sizeof[semaphore.sem_t]).cast[Ptr[semaphore.sem_t]]
+
+    private def slot(i: Int) =
+      new Buffer(
+        m + sizeof[semaphore.sem_t] * 3 + i * (sizeof[native.CInt] + blockSize))
 
     var in = 0
     var out = 0
+
+    (0 until elements).foreach { i =>
+      slot(i).size = 0
+    }
 
     if (semaphore.sem_init(semEmpty, 1, elements.toUInt) != 0) {
       throw new RuntimeException("semaphore init fail " + errno.errno)
@@ -65,7 +88,49 @@ object Pipe {
     if (semaphore.sem_init(semFull, 1, 0.toUInt) != 0) {
       throw new RuntimeException("semaphore init fail " + errno.errno)
     }
-    bufferSize = 0
+    if (semaphore.sem_init(semLock, 1, 1.toUInt) != 0) {
+      throw new RuntimeException("semaphore init fail " + errno.errno)
+    }
+
+    def write(data: Array[Byte], offset: Int, block: Boolean): Option[Int] = {
+      val quit = wait(semEmpty, block)
+      if (quit) None
+      else {
+
+        wait(semLock, true)
+        val copied = slot(in).write(data, offset, blockSize)
+        in += 1
+        if (in == elements) {
+          in = 0
+        }
+
+        semaphore.sem_post(semLock)
+        semaphore.sem_post(semFull)
+
+        Some(copied)
+      }
+
+    }
+
+    def read(data: Array[Byte], offset: Int, block: Boolean): Option[Int] = {
+      val quit = wait(semFull, block)
+
+      if (quit) None
+      else {
+
+        wait(semLock, true)
+        val copied = slot(out).read(data, offset, blockSize)
+        out += 1
+        if (out == elements) {
+          out = 0
+        }
+
+        semaphore.sem_post(semLock)
+        semaphore.sem_post(semEmpty)
+        Some(copied)
+
+      }
+    }
 
     private def wait(sem: Ptr[semaphore.sem_t], block: Boolean): Boolean = {
       if (block) {
@@ -93,47 +158,6 @@ object Pipe {
         else if (r == -1 && errno.errno == posix.errno.EAGAIN)
           true
         else false
-      }
-    }
-
-    def write(data: Array[Byte], offset: Int, block: Boolean): Option[Int] = {
-      val quit = wait(semEmpty, block)
-      if (quit) None
-      else {
-
-        val copied = scala.math.min(data.length - offset, blockSize)
-
-        memcpy(dest = buffer,
-               src = data.asInstanceOf[runtime.ByteArray].at(offset),
-               count = copied)
-        bufferSize = copied
-        semaphore.sem_post(semFull)
-
-        Some(copied)
-      }
-
-    }
-
-    def read(data: Array[Byte], offset: Int, block: Boolean): Option[Int] = {
-      val quit = wait(semFull, block)
-
-      if (quit) None
-      else {
-
-        if (errno.errno == posix.errno.EINTR)
-          throw new RuntimeException("interrupt")
-
-        val copied = bufferSize
-        if (offset + copied >= data.length) {
-          throw new RuntimeException("buffer too small")
-        }
-
-        memcpy(dest = data.asInstanceOf[runtime.ByteArray].at(offset),
-               src = buffer,
-               count = copied)
-        semaphore.sem_post(semEmpty)
-        Some(copied)
-
       }
     }
 
