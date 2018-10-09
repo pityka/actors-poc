@@ -14,47 +14,58 @@ import scalanative.posix.sys.types._
 object Pipe {
   import native._
   import Nat._
-  type _256 = Digit[_2, Digit[_5, _6]]
-  val capacity = 256
-  type PipeT =
-    native.CStruct4[semaphore.sem_t,
-                    semaphore.sem_t,
-                    Int,
-                    native.CArray[Byte, _256]]
-  private val Size_PipeT = native.sizeof[PipeT]
+  // type PipeT = Ptr[Byte]
+  // native.CStruct4[semaphore.sem_t,
+  //                 semaphore.sem_t,
+  //                 Int,
+  //                 native.CArray[Byte, _256]]
+  // private val Size_PipeT = native.sizeof[PipeT]
 
-  def allocate: Pipe = {
+  def allocate(elements: Int, blockSize: Int): Pipe = {
+    val capacity = elements * blockSize
+    val size = sizeof[semaphore.sem_t] * 2 + sizeof[native.CInt] + capacity
     import mmanconst._
     val ptr = mman
       .mmap(null,
-            Size_PipeT,
+            size,
             PROT_READ | PROT_WRITE,
             MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
             -1,
             0)
 
     if (ptr.cast[native.CUnsignedLong] == MAP_FAILED) {
-      throw new RuntimeException(
-        "mmap failed " + errno.errno + " " + Size_PipeT)
+      throw new RuntimeException("mmap failed " + errno.errno + " " + size)
     }
 
-    val pipeT = ptr.asInstanceOf[Ptr[PipeT]]
-    new Pipe(pipeT)
+    val pipeT = ptr //.asInstanceOf[Ptr[PipeT]]
+    new Pipe(pipeT, capacity, elements, blockSize)
   }
 
-  class Pipe(private val m: Ptr[PipeT]) {
-    private def semFull = m._1
-    private def semEmpty = m._2
-    private def bufferSize = !m._3
-    private def bufferSize_=(c: Int) = !m._3 = c
-    private def buffer: Ptr[Byte] = (m._4)._1
+  class Pipe private[babyactors] (private val m: Ptr[Byte],
+                                  private val capacity: Int,
+                                  private val elements: Int,
+                                  private val blockSize: Int) {
+    private def semFull: Ptr[semaphore.sem_t] = m.cast[Ptr[semaphore.sem_t]]
+    private def semEmpty: Ptr[semaphore.sem_t] =
+      (m + sizeof[semaphore.sem_t]).cast[Ptr[semaphore.sem_t]]
+    private def bufferSize: Int = m(sizeof[semaphore.sem_t] * 2)
+    private def bufferSize_=(c: Int) = {
+      val m2 = (m + sizeof[semaphore.sem_t] * 2).cast[Ptr[Int]]
+      m2(0) = c
+    }
+    private def buffer: Ptr[Byte] =
+      m + sizeof[semaphore.sem_t] * 2 + sizeof[native.CInt]
 
-    if (semaphore.sem_init(semEmpty, 1, 1.toUInt) != 0) {
+    var in = 0
+    var out = 0
+
+    if (semaphore.sem_init(semEmpty, 1, elements.toUInt) != 0) {
       throw new RuntimeException("semaphore init fail " + errno.errno)
     }
     if (semaphore.sem_init(semFull, 1, 0.toUInt) != 0) {
       throw new RuntimeException("semaphore init fail " + errno.errno)
     }
+    bufferSize = 0
 
     private def wait(sem: Ptr[semaphore.sem_t], block: Boolean): Boolean = {
       if (block) {
@@ -90,7 +101,7 @@ object Pipe {
       if (quit) None
       else {
 
-        val copied = scala.math.min(data.length - offset, capacity)
+        val copied = scala.math.min(data.length - offset, blockSize)
 
         memcpy(dest = buffer,
                src = data.asInstanceOf[runtime.ByteArray].at(offset),

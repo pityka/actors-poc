@@ -128,8 +128,8 @@ object Hello extends App {
   //   semaphore.sem_post(sem)
   // }
 
-  val pipe = Pipe.allocate
-  val pipe2 = Pipe.allocate
+  val pipe = Pipe.allocate(7, 512)
+  val pipe2 = Pipe.allocate(7, 512)
   val pid = unistd.fork()
   if (pid == 0) {
     val data = "Hi".getBytes("UTF-8")

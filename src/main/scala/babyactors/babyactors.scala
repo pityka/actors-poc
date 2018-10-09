@@ -169,8 +169,8 @@ private[babyactors] object Impl {
     }
 
     def createDispatcher: DispatcherPipes = {
-      val pipeFromChild = babyactors.Pipe.allocate
-      val pipeToChild = babyactors.Pipe.allocate
+      val pipeFromChild = babyactors.Pipe.allocate(7, 512)
+      val pipeToChild = babyactors.Pipe.allocate(7, 512)
 
       val forkedPid = unistd.fork()
       if (forkedPid == -1) throw new RuntimeException("fork failed")
