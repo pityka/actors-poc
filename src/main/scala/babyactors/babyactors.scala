@@ -49,7 +49,7 @@ abstract class Actor(ctx: ActorContext) {
 }
 
 class ActorSystem(message: Message) {
-  private val multiplex = Impl.Multiplex.create(message)
+  private val multiplex = Impl.createRoot(message)
 }
 
 object ActorSystem {
@@ -66,16 +66,32 @@ case class ActorContext(
   def send(message: Message) = dispatcher.send(message)
 }
 
-class Dispatcher(private val multiplex: Impl.MultiplexPipes) {
+class Dispatcher(private val pipeIn: Pipe2.ShPipeReadEnd,
+                 private val pipeUp: Option[Pipe2.ShPipeWriteEnd],
+                 val self: DispatcherRef,
+                 private val pipeInWrite: Option[Pipe2.ShPipeWriteEnd]) {
+  def root = pipeUp.isEmpty
   private val actors = scala.collection.mutable.Map[ActorRef, Actor]()
+  private val knownDispatchers =
+    scala.collection.mutable.Map[DispatcherRef, Pipe2.ShPipeWriteEnd]()
 
-  private def next = multiplex.pipeFrom.blockRead
+  private def next = pipeIn.blockRead
 
-  def send(message: Message) =
-    multiplex.pipeTo.blockWrite(message)
+  def send(message: Message): Unit =
+    knownDispatchers.get(message.recipient.dispatcher) match {
+      case Some(writeEnd)           => writeEnd.blockWrite(message)
+      case None if pipeUp.isDefined => pipeUp.get.blockWrite(message)
+      case None if message.recipient.dispatcher == self =>
+        pipeInWrite.get.blockWrite(message)
+      case None =>
+        // println(self + " create " + message.recipient.dispatcher)
+        val writeEnd = Impl
+          .createDispatcher(message.recipient.dispatcher, pipeInWrite.get)
+        knownDispatchers.update(message.recipient.dispatcher, writeEnd)
+        writeEnd.blockWrite(message)
+    }
 
-  while (true) {
-    val message = next
+  def actorReceive(message: Message) = {
     val recipient = message.recipient
     actors.get(recipient) match {
       case None =>
@@ -87,213 +103,140 @@ class Dispatcher(private val multiplex: Impl.MultiplexPipes) {
         actor.receive(message.payload)
     }
   }
+
+  while (true) {
+    val message = next
+    // println(self + " " + message)
+    val recipient = message.recipient
+    val dispatcher = recipient.dispatcher
+    if (pipeUp.isDefined && dispatcher != self)
+      throw new RuntimeException("routing error")
+    else {
+      if (dispatcher == self) actorReceive(message)
+      else {
+        send(message)
+      }
+    }
+
+  }
 }
 
 private[babyactors] object Impl {
 
   private object Helpers {
 
-    def setNonblock(fd: Int) = {
-      val currentFlags = fcntl.fcntl(fd, fcntl.F_GETFL, 0)
-      fcntl.fcntl(fd, fcntl.F_SETFL, currentFlags | fcntl.O_NONBLOCK)
-    }
-
-    def mkPipe = {
-      val link = Array(0, 0).asInstanceOf[runtime.IntArray].at(0)
-      val ret = unistd.pipe(link)
-      if (ret == -1) throw new RuntimeException("pipe failed")
-      else link
-    }
-
     def killall(pids: Seq[Int]) =
       pids.foreach(pid => signal.kill(pid, signal.SIGTERM))
   }
   import Helpers._
 
-  case class DispatcherPipes(pipeTo: Pipe2.ShPipeWriteEnd,
-                             pipeFrom: Pipe2.ShPipeReadEnd)
-  case class MultiplexPipes(pipeTo: Pipe2.ShPipeWriteEnd,
-                            pipeFrom: Pipe2.ShPipeReadEnd)
+  /**  Static field to hold a set of pids
+    */
+  var pids = List[Int]()
 
-  object Multiplex {
+  def createRoot(firstMessage: Message): Unit = {
 
-    /**  Static field to hold a set of pids
-      *
-      * Used both by the multiplex and the main process (each its own copy)
-      *
-      */
-    var pids = List[Int]()
+    val pipe = babyactors.Pipe.allocate(7, 512)
+    val read = Pipe2.ShPipeReadEnd(pipe)
+    val write = Pipe2.ShPipeWriteEnd(pipe)
+    write.blockWrite(firstMessage)
 
-    def create(firstMessage: Message): Unit = {
-
-      val m = new Multiplex(firstMessage)
-
-      def handler(s: Int) = s match {
-        case s if s == signal.SIGTERM => killall(Multiplex.pids)
-        case _                        => println("signal " + signal)
-      }
-
-      signal.signal(signal.SIGTERM, CFunctionPtr.fromFunction1(handler))
-
-      m.loop
-
-      throw new RuntimeException("multiplex.loop never returns")
+    def handler(s: Int) = s match {
+      case s if s == signal.SIGTERM => killall(pids)
+      case _                        => println("signal " + signal)
     }
 
+    signal.signal(signal.SIGTERM, CFunctionPtr.fromFunction1(handler))
+
+    val dispatcher = new Dispatcher(read, None, DispatcherRef(0), Some(write))
+
+    throw new RuntimeException("multiplex.loop never returns")
   }
 
-  class Multiplex(firstMessage: Message) {
-    val buffer = Queue[Message](firstMessage)
-    val sendBuffer = Queue[(Message, DispatcherPipes)]()
-    val actors = ListBuffer[(ActorRef, DispatcherPipes)]()
+  def createDispatcher(ref: DispatcherRef,
+                       pipeUp: Pipe2.ShPipeWriteEnd): Pipe2.ShPipeWriteEnd = {
+    val pipe = babyactors.Pipe.allocate(7, 512)
+    val read = Pipe2.ShPipeReadEnd(pipe)
+    val write = Pipe2.ShPipeWriteEnd(pipe)
 
-    def dispatchers =
-      actors.map { case (actorRef, pipes) => (actorRef.dispatcher, pipes) }.distinct
+    val forkedPid = unistd.fork()
+    if (forkedPid == -1) throw new RuntimeException("fork failed")
+    else if (forkedPid == 0) {
+      // child
 
-    def allPipes =
-      actors.iterator.map(_._2)
+      new Dispatcher(read, Some(pipeUp), ref, None)
 
-    def read(pipe: DispatcherPipes) =
-      pipe.pipeFrom.nonBlockingRead.foreach { msg =>
-        buffer.enqueue(msg)
-      }
+      throw new RuntimeException("fork child never returns")
+    } else {
+      // parent
 
-    def readAll() =
-      allPipes.foreach(read)
-
-    def tryWrite(message: Message, pipes: DispatcherPipes) = {
-      val success = pipes.pipeTo.nonBlockingWrite(message)
-      if (!success) {
-        sendBuffer.enqueue((message, pipes))
-      }
-    }
-
-    def createDispatcher: DispatcherPipes = {
-      val pipeFromChild = babyactors.Pipe.allocate(7, 512)
-      val pipeToChild = babyactors.Pipe.allocate(7, 512)
-
-      val forkedPid = unistd.fork()
-      if (forkedPid == -1) throw new RuntimeException("fork failed")
-      else if (forkedPid == 0) {
-        // child
-
-        new Dispatcher(
-          multiplex =
-            MultiplexPipes(pipeTo = Pipe2.ShPipeWriteEnd(pipeFromChild),
-                           pipeFrom = Pipe2.ShPipeReadEnd(pipeToChild)))
-
-        throw new RuntimeException("fork child never returns")
-      } else {
-        // parent
-
-        val pipes = DispatcherPipes(pipeTo = Pipe2.ShPipeWriteEnd(pipeToChild),
-                                    pipeFrom =
-                                      Pipe2.ShPipeReadEnd(pipeFromChild))
-        Multiplex.pids = forkedPid :: Multiplex.pids
-        pipes
-
-      }
-    }
-
-    def processMessage(m: Message) = m match {
-      case Message(recipient, _) =>
-        actors.find(_._1 == recipient) match {
-          case Some((_, dispatcher)) => tryWrite(m, dispatcher)
-          case None =>
-            dispatchers.find(_._1 == recipient.dispatcher) match {
-              case Some((_, dispatcherPipes)) =>
-                actors.append((recipient, dispatcherPipes))
-                tryWrite(m, dispatcherPipes)
-              case None =>
-                val newPipes = createDispatcher
-                actors.append((recipient, newPipes))
-                tryWrite(m, newPipes)
-            }
-        }
+      pids = forkedPid :: pids
+      write
 
     }
-
-    def processAll() =
-      buffer.dequeueAll(_ => true).foreach(processMessage)
-
-    def tryWriteAll() =
-      sendBuffer.dequeueAll(_ => true).foreach {
-        case (m, pipe) => tryWrite(m, pipe)
-      }
-
-    val readSet = stdlib.malloc(8).asInstanceOf[Ptr[select.fd_set]]
-    val writeSet = stdlib.malloc(8).asInstanceOf[Ptr[select.fd_set]]
-
-    def loop = while (true) {
-      tryWriteAll()
-      processAll()
-      // selectIo()
-      readAll()
-    }
-
   }
 
-  object Pipe2 {
-    case class ShPipeReadEnd(from: babyactors.Pipe.Pipe) {
-      val buffer = Array.ofDim[Byte](100)
-      def blockRead: Message = {
+}
 
-        var count = from.read(buffer, 0, block = true).get
+object Pipe2 {
+  case class ShPipeReadEnd(from: babyactors.Pipe.Pipe) {
+    val buffer = Array.ofDim[Byte](1024)
+    def blockRead: Message = {
+
+      var count = from.read(buffer, 0, block = true).get
+      val bb = java.nio.ByteBuffer.wrap(buffer)
+      val length = bb.getInt
+      while (count < length + 4) {
+        count = from.read(buffer, count, block = true).get
+      }
+      Message.fromFramePayload(buffer, 4, length)
+    }
+
+    def nonBlockingRead: Option[Message] = {
+
+      var count = from.read(buffer, 0, block = false)
+      if (count.isEmpty) None
+      else {
         val bb = java.nio.ByteBuffer.wrap(buffer)
         val length = bb.getInt
-        while (count < length + 4) {
-          count = from.read(buffer, count, block = true).get
+        while (count.get < length + 4) {
+          count = from.read(buffer, count.get, block = true)
         }
-        Message.fromFramePayload(buffer, 4, length)
+        Some(Message.fromFramePayload(buffer, 4, length))
       }
+    }
 
-      def nonBlockingRead: Option[Message] = {
-
-        var count = from.read(buffer, 0, block = false)
-        if (count.isEmpty) None
-        else {
-          val bb = java.nio.ByteBuffer.wrap(buffer)
-          val length = bb.getInt
-          while (count.get < length + 4) {
-            count = from.read(buffer, count.get, block = true)
-          }
-          Some(Message.fromFramePayload(buffer, 4, length))
-        }
+  }
+  case class ShPipeWriteEnd(to: babyactors.Pipe.Pipe) {
+    def blockWrite(message: Message): Unit = {
+      val buffer = Message.toFrame(message)
+      var count = 0
+      val len = buffer.length
+      while (count < len) {
+        val written = to.write(buffer, count, true).get
+        count += written
       }
 
     }
-    case class ShPipeWriteEnd(to: babyactors.Pipe.Pipe) {
-      def blockWrite(message: Message): Unit = {
-        val buffer = Message.toFrame(message)
-        var count = 0
-        val len = buffer.length
-        while (count < len) {
-          val written = to.write(buffer, count, true).get
-          count += written
-        }
-
-      }
-      def nonBlockingWrite(message: Message): Boolean = {
-        val buffer = Message.toFrame(message)
-        var count = 0
-        val len = buffer.length
-        var notReady = false
-        while (count < len && !notReady) {
-          val written = to.write(buffer, count, false)
-          if (written.isEmpty) {
-            if (count == 0) {
-              notReady = true
-            } else {
-              println("continue to write")
-            }
+    def nonBlockingWrite(message: Message): Boolean = {
+      val buffer = Message.toFrame(message)
+      var count = 0
+      val len = buffer.length
+      var notReady = false
+      while (count < len && !notReady) {
+        val written = to.write(buffer, count, false)
+        if (written.isEmpty) {
+          if (count == 0) {
+            notReady = true
+          } else {
+            println("continue to write")
           }
-          count += written.getOrElse(0)
         }
-        if (notReady) false
-        else true
-
+        count += written.getOrElse(0)
       }
+      if (notReady) false
+      else true
+
     }
   }
-
 }

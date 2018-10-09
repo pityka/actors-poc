@@ -19,7 +19,9 @@ class PingPong(mate: ActorRef, ctx: ActorContext) extends Actor(ctx) {
   def receive: PartialFunction[String, Unit] = {
     case msg =>
       val c = msg.toInt
-      ctx.send(Message(mate, (c + 1).toString))
+      if (c < 10000000) {
+        ctx.send(Message(mate, (c + 1).toString))
+      }
       if (c % 10000 == 0) {
         println((System.nanoTime - t1) / 1E6)
         t1 = System.nanoTime

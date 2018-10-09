@@ -106,6 +106,7 @@ object Pipe {
 
         semaphore.sem_post(semLock)
         semaphore.sem_post(semFull)
+        // println("> " + in + " " + out)
 
         Some(copied)
       }
